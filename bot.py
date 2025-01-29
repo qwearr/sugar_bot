@@ -4,7 +4,11 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import MessageEntityType
 
-TOKEN = "7578907008:AAE-9JSmGaqm3fDR8yAlsBm-8CNo8Ui6x-Q"
+# Получение токена из переменной окружения
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Переменная окружения TELEGRAM_BOT_TOKEN не установлена.")
+
 DATA_FILE = "habit_data.json"
 
 # Загрузка данных из файла
