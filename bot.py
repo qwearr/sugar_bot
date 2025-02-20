@@ -1,260 +1,199 @@
 import json
 import datetime
 import os
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from telegram.constants import MessageEntityType
+import pytz
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# Получение токена из переменной окружения
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+# Загружаем конфиг из файла
+CONFIG_FILE = "config.json"
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, "r") as file:
+            return json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print("❌ Ошибка: config.json не найден или поврежден!")
+        return {}
+
+# Загружаем токен
+config = load_config()
+TOKEN = config.get("BOT_TOKEN", "")
+
 if not TOKEN:
-    raise RuntimeError("Переменная окружения TELEGRAM_BOT_TOKEN не установлена.")
+    raise ValueError("❌ Ошибка: Токен бота не найден в config.json!")
 
 DATA_FILE = "habit_data.json"
 
-# Загрузка данных из файла
+# Базовый часовой пояс — UTC+0
+UTC_TZ = pytz.utc
+
+# Функции для работы с файлами
 def load_data():
     try:
         with open(DATA_FILE, "r") as file:
-            return json.load(file)
+            data = json.load(file)
+            
+            # Проверяем, есть ли у всех пользователей нужные ключи
+            for user_id in data:
+                data[user_id].setdefault("days_tracked", 1)
+                data[user_id].setdefault("days_no_sugar", 0)
+                data[user_id].setdefault("current_streak", 0)
+                data[user_id].setdefault("record_streak", 0)
+                data[user_id].setdefault("first_day", None)
+                data[user_id].setdefault("last_report_date", None)
+                data[user_id].setdefault("habit_done", False)
+                data[user_id].setdefault("previous_streak", 0)
+            
+            return data
     except FileNotFoundError:
         return {}
 
-# Сохранение данных в файл
 def save_data():
     with open(DATA_FILE, "w") as file:
         json.dump(habit_data, file, indent=4)
 
 habit_data = load_data()
 
-async def eda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    today = str(datetime.date.today())
-    username = update.effective_user.username or update.effective_user.first_name or f"User {user_id}"
+# Функция для отправки кнопок с действиями
+async def send_action_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("✅ Отметить день", callback_data="done")],
+        [InlineKeyboardButton("📊 Посмотреть статистику", callback_data="stats")],
+        [InlineKeyboardButton("🔄 Восстановить рекордную серию", callback_data="restore_streak")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Выбери действие:", reply_markup=reply_markup)
 
-    # Убедимся, что пользователь зарегистрирован
-    if user_id not in habit_data:
-        habit_data[user_id] = {
-            "username": username,
-            "days_participated": 0,
-            "days_no_sugar": 0,
-            "current_streak": 0,
-            "last_report_date": None,
-            "habit_done": False,
-            "daily_scores": {},  # Для хранения оценок по дням
-            "weekly_score": 0   # Сумма оценок за текущую неделю
-        }
+# Обработчик нажатий на кнопки
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()  # Подтверждение клика
 
-    # Проверяем корректность ввода
-    if len(context.args) != 1 or not context.args[0].isdigit():
-        await update.message.reply_text("Пожалуйста, укажите оценку от 1 до 10. Пример: /eda 8")
-        return
+    if query.data == "done":
+        await done(update, context)
+    elif query.data == "stats":
+        await stats(update, context)
+    elif query.data == "restore_streak":
+        await restore_streak(update, context)
 
-    score = int(context.args[0])
-    if score < 1 or score > 10:
-        await update.message.reply_text("Оценка должна быть числом от 1 до 10.")
-        return
-
-    # Проверяем, есть ли оценка на сегодня
-    if today in habit_data[user_id]["daily_scores"]:
-        await update.message.reply_text("Ты уже добавил оценку за сегодня.")
-        return
-
-    # Добавляем оценку
-    habit_data[user_id]["daily_scores"][today] = score
-    habit_data[user_id]["weekly_score"] += score
-    save_data()
-
-    # Формируем сообщение для пользователя
-    total_score = habit_data[user_id]["weekly_score"]
-    message = (
-        f"Твоя оценка за сегодня: {score}\n"
-        f"Сумма баллов за текущую неделю (включая сегодня): {total_score}"
-    )
-
-    await update.message.reply_text(message)
-
-# Еженедельный сброс и публикация топа
-async def reset_weekly_scores(context: ContextTypes.DEFAULT_TYPE):
-    if not habit_data:
-        return
-
-    # Формируем список лидеров по итогам недели
-    leaderboard = sorted(
-        habit_data.items(),
-        key=lambda x: x[1].get("weekly_score", 0),
-        reverse=True
-    )
-
-    # Формируем сообщение с топом
-    message = "Топ пользователей за эту неделю:\n"
-    for i, (user_id, data) in enumerate(leaderboard, start=1):
-        message += f"{i}. {data['username']}: {data['weekly_score']} баллов\n"
-
-    # Сбрасываем недельные баллы
-    for user_id, data in habit_data.items():
-        data["weekly_score"] = 0
-        data["daily_scores"] = {}
-    save_data()
-
-    # Отправляем сообщение в общий чат
-    try:
-        await context.bot.send_message(chat_id=context.job.chat_id, text=message)
-    except Exception as e:
-        print(f"Ошибка отправки сообщения с топом: {e}")
-
-# Команда /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)  # ID пользователя
-    username = update.effective_user.username or update.effective_user.first_name or f"User {user_id}"  # Никнейм или имя
-    if user_id not in habit_data:
-        habit_data[user_id] = {
-            "username": username,
-            "days_participated": 0,
-            "days_no_sugar": 0,
-            "current_streak": 0,
-            "last_report_date": None,
-            "habit_done": False,
-            "daily_scores": {},  # Для хранения оценок по дням
-            "weekly_score": 0   # Сумма оценок за текущую неделю
-        }
-    save_data()
-    await update.message.reply_text("Привет, {username}! Каждый день отмечай, ел ли ты сахар, используя /done. Если забудешь, я напомню!")
-
-# Команда /done
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     username = update.effective_user.username or update.effective_user.first_name or f"User {user_id}"
-    today = str(datetime.date.today())
+    
+    # Получаем текущую дату в UTC
+    today = datetime.datetime.now(UTC_TZ).date().isoformat()
 
-    # Если пользователя нет в словаре, регистрируем его
+    # Если пользователя нет в базе, создаем его профиль
     if user_id not in habit_data:
         habit_data[user_id] = {
             "username": username,
-            "days_participated": 0,
-            "days_no_sugar": 0,
-            "current_streak": 0,
-            "last_report_date": None,
-            "habit_done": False
+            "days_tracked": 1,  # Начинаем учет с 1 дня
+            "days_no_sugar": 1,  # Первый день без сахара
+            "current_streak": 1,  # Начальный стрик
+            "record_streak": 1,  # Начальный рекордный стрик
+            "first_day": today,  # Дата первого использования
+            "last_report_date": today,
+            "habit_done": True,
+            "previous_streak": 0  # Сохраняем стрик на случай восстановления
         }
     else:
-        # Обновляем username, если его нет или он изменился
-        if "username" not in habit_data[user_id] or habit_data[user_id]["username"] != username:
-            habit_data[user_id]["username"] = username
-            save_data()        
+        # Если уже отмечался сегодня
+        if habit_data[user_id]["last_report_date"] == today:
+            await update.callback_query.message.reply_text("Ты уже отметила выполнение привычки сегодня.")
+            return
 
-    # Проверяем, отмечал ли пользователь сегодня
-    if habit_data[user_id]["last_report_date"] == today:
-        await update.message.reply_text("Ты уже отметил выполнение привычки сегодня.")
-        return
+        # Обновляем данные пользователя
+        habit_data[user_id]["days_tracked"] += 1
+        habit_data[user_id]["days_no_sugar"] += 1
 
-    # Обновляем данные
-    habit_data[user_id]["last_report_date"] = today
-    habit_data[user_id]["habit_done"] = True
-    habit_data[user_id]["days_participated"] += 1
-    habit_data[user_id]["days_no_sugar"] += 1
-    habit_data[user_id]["current_streak"] += 1
-    save_data()  # Сохраняем изменения
-    await update.message.reply_text(f"Отлично, {username}! Ты не ел сахар сегодня!")
+        # Проверяем, был ли пропущен день
+        last_date = datetime.date.fromisoformat(habit_data[user_id]["last_report_date"])
+        yesterday = (datetime.datetime.now(UTC_TZ) - datetime.timedelta(days=1)).date()
 
-# Напоминание в 21:00
-async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
-    today = str(datetime.date.today())
+        if last_date == yesterday:  # Если отметился вчера
+            habit_data[user_id]["current_streak"] += 1
+        else:  # Если был пропущенный день
+            habit_data[user_id]["previous_streak"] = habit_data[user_id]["current_streak"]
+            habit_data[user_id]["current_streak"] = 1  # Начинаем новый стрик
 
-    for user_id, data in habit_data.items():
-        if data["last_report_date"] != today or not data["habit_done"]:
-            try:
-                await context.bot.send_message(chat_id=user_id, text="Напоминание! Отметь, ел ли ты сахар, используя /done.")
-            except Exception as e:
-                print(f"Ошибка при отправке сообщения пользователю {user_id}: {e}")
+        # Проверяем рекордный стрик
+        if habit_data[user_id]["current_streak"] > habit_data[user_id]["record_streak"]:
+            habit_data[user_id]["record_streak"] = habit_data[user_id]["current_streak"]
 
-# Фиксация "не выполнено" в 00:00
-async def finalize_day(context: ContextTypes.DEFAULT_TYPE):
-    today = str(datetime.date.today())
+        habit_data[user_id]["last_report_date"] = today
+        habit_data[user_id]["habit_done"] = True
 
-    for user_id, data in habit_data.items():
-        if data["last_report_date"] != today or not data["habit_done"]:
-            data["days_participated"] += 1
-            data["current_streak"] = 0
-        data["habit_done"] = False
     save_data()
+    await update.callback_query.message.reply_text(f"Отлично, {username}! Ты не ела сахар сегодня! 🔥")
 
-# Команда /stats
+# Команда /stats (исправлено)
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
 
     if user_id not in habit_data:
-        await update.message.reply_text("Ты ещё не зарегистрировался. Используй /start.")
+        await update.callback_query.message.reply_text("Ты ещё не зарегистрировалась. Используй /start.")
         return
 
     user_data = habit_data[user_id]
-    message = (
-        f"Статистика:\n"
-        f"Дней в программе: {user_data['days_participated']}\n"
-        f"Дней без сахара: {user_data['days_no_sugar']}\n"
-        f"Текущая серия: {user_data['current_streak']} дней"
-    )
-    await update.message.reply_text(message)
 
-   # Команда /leaderboard
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not habit_data:
-        await update.message.reply_text("Ещё никто не участвует в программе.")
+    # Проверяем, есть ли все нужные ключи
+    user_data.setdefault("days_tracked", 1)
+    user_data.setdefault("days_no_sugar", 0)
+    user_data.setdefault("current_streak", 0)
+    user_data.setdefault("record_streak", 0)
+
+    message = (
+        f"📊 Твоя статистика:\n"
+        f"📅 Дней ведется учет: {user_data['days_tracked']}\n"
+        f"🍏 Дней без сахара: {user_data['days_no_sugar']}\n"
+        f"🔥 Текущий серия без сахара: {user_data['current_streak']} дней подряд\n"
+        f"🏆 Рекорд: {user_data['record_streak']} дней подряд"
+    )
+    await update.callback_query.message.reply_text(message)
+
+async def restore_streak(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    today = datetime.datetime.now(UTC_TZ).date().isoformat()
+    yesterday = (datetime.datetime.now(UTC_TZ) - datetime.timedelta(days=1)).date().isoformat()
+
+    if user_id not in habit_data:
+        await update.callback_query.message.reply_text("Ты ещё не зарегистрировалась. Используй /start.")
         return
 
-    # Лидеры по текущему стрику
-    streak_leaders = sorted(
-        habit_data.items(),
-        key=lambda x: x[1].get("current_streak", 0),
-        reverse=True
-    )[:3]
+    user_data = habit_data[user_id]
 
-    # Лидеры по дням без сахара
-    sugar_free_leaders = sorted(
-        habit_data.items(),
-        key=lambda x: x[1].get("days_no_sugar", 0),
-        reverse=True
-    )[:3]
+    if user_data["last_report_date"] == yesterday and user_data["current_streak"] == 0:
+        user_data["current_streak"] = user_data["previous_streak"]  # Восстанавливаем предыдущий стрик
+        user_data["last_report_date"] = today  # Фиксируем, что пользователь "отметился"
+        save_data()
+        await update.callback_query.message.reply_text("✅ Последовательность восстановлена!")
+    else:
+        await update.callback_query.message.reply_text("❌ Невозможно восстановить последовательность. Ты либо не пропускала день, либо прошло слишком много времени.")
 
-    # Формируем сообщение для вывода
-    streak_message = "Лидеры по текущему стрику:\n"
-    for i, (user_id, data) in enumerate(streak_leaders, start=1):
-        username = data.get("username", f"User {user_id}")
-        streak_message += f"{i}. {username}: {data['current_streak']} дней подряд\n"
+async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.datetime.now(UTC_TZ).date().isoformat()
 
-    sugar_free_message = "Лидеры по дням без сахара:\n"
-    for i, (user_id, data) in enumerate(sugar_free_leaders, start=1):
-        username = data.get("username", f"User {user_id}")
-        sugar_free_message += f"{i}. {username}: {data['days_no_sugar']} дней\n"
+    for user_id, data in habit_data.items():
+        if data["last_report_date"] != today or not data["habit_done"]:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="📢 Напоминание! Отметь, ела ли ты сахар, используя /done."
+                )
+            except Exception as e:
+                print(f"Ошибка при отправке сообщения пользователю {user_id}: {e}")
 
-    # Отправляем сообщение
-    await update.message.reply_text(f"{streak_message}\n{sugar_free_message}")
+async def finalize_day(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.datetime.now(UTC_TZ).date().isoformat()
 
-    # Команда /help
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "Доступные команды:\n"
-        "/start - Зарегистрироваться в программе.\n"
-        "/done - Отметить, что ты не ел сахар сегодня.\n"
-        "/stats - Показать твою статистику (дни участия, дни без сахара, текущая серия).\n"
-        "/leaderboard - Показать лидеров программы (по текущему стрику и дням без сахара).\n"
-        "/help - Показать эту подсказку."
-    )
-    await update.message.reply_text(help_text)
+    for user_id, data in habit_data.items():
+        if data["last_report_date"] != today:
+            data["days_tracked"] += 1
+            data["current_streak"] = 0
+            data["habit_done"] = False
 
-async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Проверяем, есть ли в сообщении команды
-    if update.message and update.message.entities:
-        for entity in update.message.entities:
-            if entity.type == MessageEntityType.BOT_COMMAND:  # Проверяем, является ли это командой
-                command = update.message.text.split()[0]  # Получаем текст команды
-                if command != "/done":  # Если команда не /done
-                    try:
-                        await update.message.delete()  # Удаляем сообщение
-                        print(f"Удалена команда: {command}")
-                    except Exception as e:
-                        print(f"Ошибка при удалении команды: {e}")
-                return  # Завершаем обработку после удаления
+    save_data()
 
 def main():
     application = Application.builder().token(TOKEN).build()
@@ -265,18 +204,12 @@ def main():
         raise RuntimeError("JobQueue не была инициализирована!")
 
     # Регистрация команд
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("done", done))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("leaderboard", leaderboard))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("eda", eda))
-    application.add_handler(MessageHandler(filters.COMMAND, handle_commands))
+    application.add_handler(CommandHandler("start", send_action_buttons))
+    application.add_handler(CallbackQueryHandler(button_click))
 
-    # Планирование задач
-    job_queue.run_daily(send_reminders, time=datetime.time(21, 0))
-    job_queue.run_daily(finalize_day, time=datetime.time(0, 0))
-    job_queue.run_daily(reset_weekly_scores, time=datetime.time(12, 0), days=[6])  # Каждую субботу
+    # Планирование задач (в UTC)
+    job_queue.run_daily(send_reminders, time=datetime.time(21, 0, tzinfo=UTC_TZ))
+    job_queue.run_daily(finalize_day, time=datetime.time(0, 0, tzinfo=UTC_TZ))
 
     # Запуск бота
     application.run_polling()
