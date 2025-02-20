@@ -137,6 +137,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_data = habit_data[user_id]
 
+    # Если у пользователя нет ни одного дня без сахара
+    if user_data.get("days_no_sugar", 0) == 0:
+        await update.callback_query.message.reply_text(f"{username}, мы пока не собрали данных о тебе. Начни отмечать дни, используя /done!")
+        return
+
     # Проверяем, есть ли все нужные ключи
     user_data.setdefault("days_tracked", 1)
     user_data.setdefault("days_no_sugar", 0)
@@ -194,6 +199,34 @@ async def finalize_day(context: ContextTypes.DEFAULT_TYPE):
             data["habit_done"] = False
 
     save_data()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Регистрирует пользователя, если он новый, и отправляет меню кнопок."""
+    user_id = str(update.effective_user.id)
+    username = update.effective_user.username or update.effective_user.first_name or f"User {user_id}"
+    today = datetime.datetime.now(UTC_TZ).date().isoformat()
+
+    # Проверяем, зарегистрирован ли пользователь
+    if user_id not in habit_data:
+        habit_data[user_id] = {
+            "username": username,
+            "days_tracked": 1,  # Начинаем учет с 1 дня
+            "days_no_sugar": 0,  # Пока нет отмеченных дней без сахара
+            "current_record": 0,  # Текущий рекорд
+            "best_record": 0,  # Максимальный рекорд
+            "first_day": today,  # Дата начала
+            "last_report_date": None,
+            "habit_done": False,
+            "previous_record": 0
+        }
+        save_data()
+        await update.message.reply_text(f"Привет, {username}! 🎉\nТы зарегистрирована в боте!\n\nТеперь ты можешь отмечать дни без сахара и следить за своей статистикой. Давай начнем!")
+
+    else:
+        await update.message.reply_text(f"Привет снова, {username}! 😊")
+
+    # Отправляем кнопки с действиями
+    await send_action_buttons(update, context)
 
 def main():
     application = Application.builder().token(TOKEN).build()
