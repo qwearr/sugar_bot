@@ -44,6 +44,7 @@ def load_data():
                 data[user_id].setdefault("last_report_date", None)
                 data[user_id].setdefault("habit_done", False)
                 data[user_id].setdefault("previous_streak", 0)
+                data[user_id].setdefault("notifications_enabled", True)
             
             return data
     except FileNotFoundError:
@@ -57,10 +58,16 @@ habit_data = load_data()
 
 # Функция для отправки кнопок с действиями
 async def send_action_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    
+    # Определяем текущий статус уведомлений
+    notifications_text = "🔔 Включить уведомления" if not habit_data[user_id].get("notifications_enabled", True) else "🔕 Отключить уведомления"
+
     keyboard = [
         [InlineKeyboardButton("✅ Отметить день", callback_data="done")],
         [InlineKeyboardButton("📊 Посмотреть статистику", callback_data="stats")],
-        [InlineKeyboardButton("🔄 Восстановить рекордную серию", callback_data="restore_streak")]
+        [InlineKeyboardButton("🔄 Восстановить рекордную серию", callback_data="restore_streak")],
+        [InlineKeyboardButton(notifications_text, callback_data="toggle_notifications")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Выбери действие:", reply_markup=reply_markup)
@@ -68,6 +75,7 @@ async def send_action_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 # Обработчик нажатий на кнопки
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = str(query.from_user.id)
     await query.answer()  # Подтверждение клика
 
     if query.data == "done":
@@ -76,6 +84,15 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await stats(update, context)
     elif query.data == "restore_streak":
         await restore_streak(update, context)
+    elif query.data == "toggle_notifications":
+        # Переключаем состояние уведомлений
+        habit_data[user_id]["notifications_enabled"] = not habit_data[user_id].get("notifications_enabled", True)
+        save_data()
+        new_status = "🔔 Уведомления включены!" if habit_data[user_id]["notifications_enabled"] else "🔕 Уведомления отключены!"
+        await query.message.reply_text(new_status)
+
+        # Обновляем кнопки
+        await send_action_buttons(update, context)
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -130,6 +147,7 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Команда /stats (исправлено)
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
+    username = update.effective_user.username or update.effective_user.first_name or f"User {user_id}"
 
     if user_id not in habit_data:
         await update.callback_query.message.reply_text("Ты ещё не зарегистрировалась. Используй /start.")
@@ -180,6 +198,10 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.datetime.now(UTC_TZ).date().isoformat()
 
     for user_id, data in habit_data.items():
+        # Проверяем, включены ли уведомления
+        if not data.get("notifications_enabled", True):
+            continue  # Пропускаем этого пользователя
+
         if data["last_report_date"] != today or not data["habit_done"]:
             try:
                 await context.bot.send_message(
@@ -241,7 +263,7 @@ def main():
     application.add_handler(CallbackQueryHandler(button_click))
 
     # Планирование задач (в UTC)
-    job_queue.run_daily(send_reminders, time=datetime.time(21, 0, tzinfo=UTC_TZ))
+    job_queue.run_daily(send_reminders, time=datetime.time(19, 0, tzinfo=UTC_TZ))
     job_queue.run_daily(finalize_day, time=datetime.time(0, 0, tzinfo=UTC_TZ))
 
     # Запуск бота
